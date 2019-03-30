@@ -1,8 +1,9 @@
 // Load modules
 
-var Dgram = require('dgram');
 var Dns = require('dns');
-var Hoek = require('hoek');
+var Dgram = require('dgram');
+var Lab = require('lab');
+var Sntp = require('../lib');
 
 
 // Declare internals
@@ -10,403 +11,425 @@ var Hoek = require('hoek');
 var internals = {};
 
 
-exports.time = function (options, callback) {
+// Test shortcuts
 
-    if (arguments.length !== 2) {
-        callback = arguments[0];
-        options = {};
-    }
+var lab = exports.lab = Lab.script();
+var before = lab.before;
+var after = lab.after;
+var describe = lab.experiment;
+var it = lab.test;
+var expect = Lab.expect;
 
-    var settings = Hoek.clone(options);
-    settings.host = settings.host || 'pool.ntp.org';
-    settings.port = settings.port || 123;
-    settings.resolveReference = settings.resolveReference || false;
 
-    // Declare variables used by callback
+describe('SNTP', function () {
 
-    var timeoutId = 0;
-    var sent = 0;
+    describe('#time', function () {
 
-    // Ensure callback is only called once
+        it('returns consistent result over multiple tries', function (done) {
 
-    var finish = function (err, result) {
+            Sntp.time(function (err, time) {
 
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            timeoutId = 0;
-        }
+                expect(err).to.not.exist;
+                expect(time).to.exist;
+                var t1 = time.t;
 
-        socket.removeAllListeners();
-        socket.once('error', internals.ignore);
-        socket.close();
-        return callback(err, result);
-    };
+                Sntp.time(function (err, time) {
 
-    finish = Hoek.once(finish);
-
-    // Create UDP socket
-
-    var socket = Dgram.createSocket('udp4');
-
-    socket.once('error', function (err) {
-
-        return finish(err);
-    });
-
-    // Listen to incoming messages
-
-    socket.on('message', function (buffer, rinfo) {
-
-        var received = Date.now();
-
-        var message = new internals.NtpMessage(buffer);
-        if (!message.isValid) {
-            return finish(new Error('Invalid server response'), message);
-        }
-
-        if (message.originateTimestamp !== sent) {
-            return finish(new Error('Wrong originate timestamp'), message);
-        }
-
-        // Timestamp Name          ID   When Generated
-        // ------------------------------------------------------------
-        // Originate Timestamp     T1   time request sent by client
-        // Receive Timestamp       T2   time request received by server
-        // Transmit Timestamp      T3   time reply sent by server
-        // Destination Timestamp   T4   time reply received by client
-        //
-        // The roundtrip delay d and system clock offset t are defined as:
-        //
-        // d = (T4 - T1) - (T3 - T2)     t = ((T2 - T1) + (T3 - T4)) / 2
-
-        var T1 = message.originateTimestamp;
-        var T2 = message.receiveTimestamp;
-        var T3 = message.transmitTimestamp;
-        var T4 = received;
-
-        message.d = (T4 - T1) - (T3 - T2);
-        message.t = ((T2 - T1) + (T3 - T4)) / 2;
-        message.receivedLocally = received;
-
-        if (!settings.resolveReference ||
-            message.stratum !== 'secondary') {
-
-            return finish(null, message);
-        }
-
-        // Resolve reference IP address
-
-        Dns.reverse(message.referenceId, function (err, domains) {
-
-            if (/* $lab:coverage:off$ */ !err /* $lab:coverage:on$ */) {
-                message.referenceHost = domains[0];
-            }
-
-            return finish(null, message);
-        });
-    });
-
-    // Set timeout
-
-    if (settings.timeout) {
-        timeoutId = setTimeout(function () {
-
-            timeoutId = 0;
-            return finish(new Error('Timeout'));
-        }, settings.timeout);
-    }
-
-    // Construct NTP message
-
-    var message = new Buffer(48);
-    for (var i = 0; i < 48; i++) {                      // Zero message
-        message[i] = 0;
-    }
-
-    message[0] = (0 << 6) + (4 << 3) + (3 << 0)         // Set version number to 4 and Mode to 3 (client)
-    sent = Date.now();
-    internals.fromMsecs(sent, message, 40);               // Set transmit timestamp (returns as originate)
-
-    // Send NTP request
-
-    socket.send(message, 0, message.length, settings.port, settings.host, function (err, bytes) {
-
-        if (err ||
-            bytes !== 48) {
-
-            return finish(err || new Error('Could not send entire message'));
-        }
-    });
-};
-
-
-internals.NtpMessage = function (buffer) {
-
-    this.isValid = false;
-
-    // Validate
-
-    if (buffer.length !== 48) {
-        return;
-    }
-
-    // Leap indicator
-
-    var li = (buffer[0] >> 6);
-    switch (li) {
-        case 0: this.leapIndicator = 'no-warning'; break;
-        case 1: this.leapIndicator = 'last-minute-61'; break;
-        case 2: this.leapIndicator = 'last-minute-59'; break;
-        case 3: this.leapIndicator = 'alarm'; break;
-    }
-
-    // Version
-
-    var vn = ((buffer[0] & 0x38) >> 3);
-    this.version = vn;
-
-    // Mode
-
-    var mode = (buffer[0] & 0x7);
-    switch (mode) {
-        case 1: this.mode = 'symmetric-active'; break;
-        case 2: this.mode = 'symmetric-passive'; break;
-        case 3: this.mode = 'client'; break;
-        case 4: this.mode = 'server'; break;
-        case 5: this.mode = 'broadcast'; break;
-        case 0:
-        case 6:
-        case 7: this.mode = 'reserved'; break;
-    }
-
-    // Stratum
-
-    var stratum = buffer[1];
-    if (stratum === 0) {
-        this.stratum = 'death';
-    }
-    else if (stratum === 1) {
-        this.stratum = 'primary';
-    }
-    else if (stratum <= 15) {
-        this.stratum = 'secondary';
-    }
-    else {
-        this.stratum = 'reserved';
-    }
-
-    // Poll interval (msec)
-
-    this.pollInterval = Math.round(Math.pow(2, buffer[2])) * 1000;
-
-    // Precision (msecs)
-
-    this.precision = Math.pow(2, buffer[3]) * 1000;
-
-    // Root delay (msecs)
-
-    var rootDelay = 256 * (256 * (256 * buffer[4] + buffer[5]) + buffer[6]) + buffer[7];
-    this.rootDelay = 1000 * (rootDelay / 0x10000);
-
-    // Root dispersion (msecs)
-
-    this.rootDispersion = ((buffer[8] << 8) + buffer[9] + ((buffer[10] << 8) + buffer[11]) / Math.pow(2, 16)) * 1000;
-
-    // Reference identifier
-
-    this.referenceId = '';
-    switch (this.stratum) {
-        case 'death':
-        case 'primary':
-            this.referenceId = String.fromCharCode(buffer[12]) + String.fromCharCode(buffer[13]) + String.fromCharCode(buffer[14]) + String.fromCharCode(buffer[15]);
-            break;
-        case 'secondary':
-            this.referenceId = '' + buffer[12] + '.' + buffer[13] + '.' + buffer[14] + '.' + buffer[15];
-            break;
-    }
-
-    // Reference timestamp
-
-    this.referenceTimestamp = internals.toMsecs(buffer, 16);
-
-    // Originate timestamp
-
-    this.originateTimestamp = internals.toMsecs(buffer, 24);
-
-    // Receive timestamp
-
-    this.receiveTimestamp = internals.toMsecs(buffer, 32);
-
-    // Transmit timestamp
-
-    this.transmitTimestamp = internals.toMsecs(buffer, 40);
-
-    // Validate
-
-    if (this.version === 4 &&
-        this.stratum !== 'reserved' &&
-        this.mode === 'server' &&
-        this.originateTimestamp &&
-        this.receiveTimestamp &&
-        this.transmitTimestamp) {
-
-        this.isValid = true;
-    }
-
-    return this;
-};
-
-
-internals.toMsecs = function (buffer, offset) {
-
-    var seconds = 0;
-    var fraction = 0;
-
-    for (var i = 0; i < 4; ++i) {
-        seconds = (seconds * 256) + buffer[offset + i];
-    }
-
-    for (i = 4; i < 8; ++i) {
-        fraction = (fraction * 256) + buffer[offset + i];
-    }
-
-    return ((seconds - 2208988800 + (fraction / Math.pow(2, 32))) * 1000);
-};
-
-
-internals.fromMsecs = function (ts, buffer, offset) {
-
-    var seconds = Math.floor(ts / 1000) + 2208988800;
-    var fraction = Math.round((ts % 1000) / 1000 * Math.pow(2, 32));
-
-    buffer[offset + 0] = (seconds & 0xFF000000) >> 24;
-    buffer[offset + 1] = (seconds & 0x00FF0000) >> 16;
-    buffer[offset + 2] = (seconds & 0x0000FF00) >> 8;
-    buffer[offset + 3] = (seconds & 0x000000FF);
-
-    buffer[offset + 4] = (fraction & 0xFF000000) >> 24;
-    buffer[offset + 5] = (fraction & 0x00FF0000) >> 16;
-    buffer[offset + 6] = (fraction & 0x0000FF00) >> 8;
-    buffer[offset + 7] = (fraction & 0x000000FF);
-};
-
-
-// Offset singleton
-
-internals.last = {
-    offset: 0,
-    expires: 0,
-    host: '',
-    port: 0
-};
-
-
-exports.offset = function (options, callback) {
-
-    if (arguments.length !== 2) {
-        callback = arguments[0];
-        options = {};
-    }
-
-    var now = Date.now();
-    var clockSyncRefresh = options.clockSyncRefresh || 24 * 60 * 60 * 1000;                    // Daily
-
-    if (internals.last.offset &&
-        internals.last.host === options.host &&
-        internals.last.port === options.port &&
-        now < internals.last.expires) {
-
-        process.nextTick(function () {
-
-            callback(null, internals.last.offset);
+                    expect(err).to.not.exist;
+                    expect(time).to.exist;
+                    var t2 = time.t;
+                    expect(Math.abs(t1 - t2)).is.below(200);
+                    done();
+                });
+            });
         });
 
-        return;
-    }
+        it('resolves reference IP', function (done) {
 
-    exports.time(options, function (err, time) {
+            Sntp.time({ host: 'ntp.exnet.com', resolveReference: true }, function (err, time) {
 
-        if (err) {
-            return callback(err, 0);
-        }
+                expect(err).to.not.exist;
+                expect(time).to.exist;
+                expect(time.referenceHost).to.exist;
+                done();
+            });
+        });
 
-        internals.last = {
-            offset: Math.round(time.t),
-            expires: now + clockSyncRefresh,
-            host: options.host,
-            port: options.port
+        it('times out on no response', function (done) {
+
+            Sntp.time({ port: 124, timeout: 100 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time).to.not.exist;
+                expect(err.message).to.equal('Timeout');
+                done();
+            });
+        });
+
+        it('errors on error event', { parallel: false }, function (done) {
+
+            var orig = Dgram.createSocket;
+            Dgram.createSocket = function (type) {
+
+                Dgram.createSocket = orig;
+                var socket = Dgram.createSocket(type);
+                setImmediate(function () { socket.emit('error', new Error('Fake')) });
+                return socket;
+            };
+
+            Sntp.time(function (err, time) {
+
+                expect(err).to.exist;
+                expect(time).to.not.exist;
+                expect(err.message).to.equal('Fake');
+                done();
+            });
+        });
+
+        it('errors on incorrect sent size', { parallel: false }, function (done) {
+
+            var orig = Dgram.Socket.prototype.send;
+            Dgram.Socket.prototype.send = function (buf, offset, length, port, address, callback) {
+
+                Dgram.Socket.prototype.send = orig;
+                return callback(null, 40);
+            };
+
+            Sntp.time(function (err, time) {
+
+                expect(err).to.exist;
+                expect(time).to.not.exist;
+                expect(err.message).to.equal('Could not send entire message');
+                done();
+            });
+        });
+
+        it('times out on invalid host', function (done) {
+
+            Sntp.time({ host: 'error', timeout: 10000 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time).to.not.exist;
+                expect(err.message).to.contain('getaddrinfo');
+                done();
+            });
+        });
+
+        it('fails on bad response buffer size', function (done) {
+
+            var server = Dgram.createSocket('udp4');
+            server.on('message', function (message, remote) {
+                var message = new Buffer(10);
+                server.send(message, 0, message.length, remote.port, remote.address, function (err, bytes) {
+
+                    server.close();
+                });
+            });
+
+            server.bind(49123);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(err.message).to.equal('Invalid server response');
+                done();
+            });
+        });
+
+        var messup = function (bytes) {
+
+            var server = Dgram.createSocket('udp4');
+            server.on('message', function (message, remote) {
+
+                var message = new Buffer([
+                    0x24, 0x01, 0x00, 0xe3,
+                    0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,
+                    0x41, 0x43, 0x54, 0x53,
+                    0xd4, 0xa8, 0x2d, 0xc7,
+                    0x1c, 0x5d, 0x49, 0x1b,
+                    0xd4, 0xa8, 0x2d, 0xe6,
+                    0x67, 0xef, 0x9d, 0xb2,
+                    0xd4, 0xa8, 0x2d, 0xe6,
+                    0x71, 0xed, 0xb5, 0xfb,
+                    0xd4, 0xa8, 0x2d, 0xe6,
+                    0x71, 0xee, 0x6c, 0xc5
+                ]);
+
+                for (var i = 0, il = bytes.length; i < il; ++i) {
+                    message[bytes[i][0]] = bytes[i][1];
+                }
+
+                server.send(message, 0, message.length, remote.port, remote.address, function (err, bytes) {
+
+                    server.close();
+                });
+            });
+
+            server.bind(49123);
         };
 
-        return callback(null, internals.last.offset);
-    });
-};
+        it('fails on bad version', function (done) {
 
+            messup([[0, (0 << 6) + (3 << 3) + (4 << 0)]]);
 
-// Now singleton
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
 
-internals.now = {
-    intervalId: 0
-};
-
-
-exports.start = function (options, callback) {
-
-    if (arguments.length !== 2) {
-        callback = arguments[0];
-        options = {};
-    }
-
-    if (internals.now.intervalId) {
-        process.nextTick(function () {
-
-            callback();
+                expect(err).to.exist;
+                expect(time.version).to.equal(3);
+                expect(err.message).to.equal('Invalid server response');
+                done();
+            });
         });
 
-        return;
-    }
+        it('fails on bad originateTimestamp', function (done) {
 
-    exports.offset(options, function (err, offset) {
+            messup([[24, 0x83], [25, 0xaa], [26, 0x7e], [27, 0x80], [28, 0], [29, 0], [30, 0], [31, 0]]);
 
-        internals.now.intervalId = setInterval(function () {
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
 
-            exports.offset(options, function () { });
-        }, options.clockSyncRefresh || 24 * 60 * 60 * 1000);                                // Daily
+                expect(err).to.exist;
+                expect(err.message).to.equal('Invalid server response');
+                done();
+            });
+        });
 
-        return callback();
+        it('fails on bad receiveTimestamp', function (done) {
+
+            messup([[32, 0x83], [33, 0xaa], [34, 0x7e], [35, 0x80], [36, 0], [37, 0], [38, 0], [39, 0]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(err.message).to.equal('Invalid server response');
+                done();
+            });
+        });
+
+        it('fails on bad originate timestamp and alarm li', function (done) {
+
+            messup([[0, (3 << 6) + (4 << 3) + (4 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(err.message).to.equal('Wrong originate timestamp');
+                expect(time.leapIndicator).to.equal('alarm');
+                done();
+            });
+        });
+
+        it('returns time with death stratum and last61 li', function (done) {
+
+            messup([[0, (1 << 6) + (4 << 3) + (4 << 0)], [1, 0]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(time.stratum).to.equal('death');
+                expect(time.leapIndicator).to.equal('last-minute-61');
+                done();
+            });
+        });
+
+        it('returns time with reserved stratum and last59 li', function (done) {
+
+            messup([[0, (2 << 6) + (4 << 3) + (4 << 0)], [1, 0x1f]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(time.stratum).to.equal('reserved');
+                expect(time.leapIndicator).to.equal('last-minute-59');
+                done();
+            });
+        });
+
+        it('fails on bad mode (symmetric-active)', function (done) {
+
+            messup([[0, (0 << 6) + (4 << 3) + (1 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time.mode).to.equal('symmetric-active');
+                done();
+            });
+        });
+
+        it('fails on bad mode (symmetric-passive)', function (done) {
+
+            messup([[0, (0 << 6) + (4 << 3) + (2 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time.mode).to.equal('symmetric-passive');
+                done();
+            });
+        });
+
+        it('fails on bad mode (client)', function (done) {
+
+            messup([[0, (0 << 6) + (4 << 3) + (3 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time.mode).to.equal('client');
+                done();
+            });
+        });
+
+        it('fails on bad mode (broadcast)', function (done) {
+
+            messup([[0, (0 << 6) + (4 << 3) + (5 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time.mode).to.equal('broadcast');
+                done();
+            });
+        });
+
+        it('fails on bad mode (reserved)', function (done) {
+
+            messup([[0, (0 << 6) + (4 << 3) + (6 << 0)]]);
+
+            Sntp.time({ host: 'localhost', port: 49123 }, function (err, time) {
+
+                expect(err).to.exist;
+                expect(time.mode).to.equal('reserved');
+                done();
+            });
+        });
     });
-};
 
+    describe('#offset', function () {
 
-exports.stop = function () {
+        it('gets the current offset', function (done) {
 
-    if (!internals.now.intervalId) {
-        return;
-    }
+            Sntp.offset(function (err, offset) {
 
-    clearInterval(internals.now.intervalId);
-    internals.now.intervalId = 0;
-};
+                expect(err).to.not.exist;
+                expect(offset).to.not.equal(0);
+                done();
+            });
+        });
 
+        it('gets the current offset from cache', function (done) {
 
-exports.isLive = function () {
+            Sntp.offset(function (err, offset) {
 
-    return !!internals.now.intervalId;
-};
+                expect(err).to.not.exist;
+                expect(offset).to.not.equal(0);
+                var offset1 = offset;
+                Sntp.offset({}, function (err, offset) {
 
+                    expect(err).to.not.exist;
+                    expect(offset).to.equal(offset1);
+                    done();
+                });
+            });
+        });
 
-exports.now = function () {
+        it('gets the new offset on different server', function (done) {
 
-    var now = Date.now();
-    if (!exports.isLive() ||
-        now >= internals.last.expires) {
+            Sntp.offset(function (err, offset) {
 
-        return now;
-    }
+                expect(err).to.not.exist;
+                expect(offset).to.not.equal(0);
+                var offset1 = offset;
+                Sntp.offset({ host: 'nist1-sj.ustiming.org' }, function (err, offset) {
 
-    return now + internals.last.offset;
-};
+                    expect(err).to.not.exist;
+                    expect(offset).to.not.equal(offset1);
+                    done();
+                });
+            });
+        });
 
+        it('gets the new offset on different server', function (done) {
 
-internals.ignore = function () {
+            Sntp.offset(function (err, offset) {
 
-};
+                expect(err).to.not.exist;
+                expect(offset).to.not.equal(0);
+                var offset1 = offset;
+                Sntp.offset({ port: 123 }, function (err, offset) {
+
+                    expect(err).to.not.exist;
+                    expect(offset).to.not.equal(offset1);
+                    done();
+                });
+            });
+        });
+
+        it('fails getting the current offset on invalid server', function (done) {
+
+            Sntp.offset({ host: 'error' }, function (err, offset) {
+
+                expect(err).to.exist;
+                expect(offset).to.equal(0);
+                done();
+            });
+        });
+    });
+
+    describe('#now', function () {
+
+        it('starts auto-sync, gets now, then stops', function (done) {
+
+            Sntp.stop();
+
+            var before = Sntp.now();
+            expect(before).to.equal(Date.now());
+
+            Sntp.start(function () {
+
+                var now = Sntp.now();
+                expect(now).to.not.equal(Date.now());
+                Sntp.stop();
+
+                done();
+            });
+        });
+
+        it('starts twice', function (done) {
+
+            Sntp.start(function () {
+
+                Sntp.start(function () {
+
+                    var now = Sntp.now();
+                    expect(now).to.not.equal(Date.now());
+                    Sntp.stop();
+
+                    done();
+                });
+            });
+        });
+
+        it('starts auto-sync, gets now, waits, gets again after timeout', function (done) {
+
+            Sntp.stop();
+
+            var before = Sntp.now();
+            expect(before).to.equal(Date.now());
+
+            Sntp.start({ clockSyncRefresh: 100 }, function () {
+
+                var now = Sntp.now();
+                expect(now).to.not.equal(Date.now());
+                expect(now).to.equal(Sntp.now());
+
+                setTimeout(function () {
+
+                    expect(Sntp.now()).to.not.equal(now);
+                    Sntp.stop();
+                    done();
+                }, 110);
+            });
+        });
+    });
+});
+
